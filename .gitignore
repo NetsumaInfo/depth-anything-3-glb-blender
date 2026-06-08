@@ -1,0 +1,28 @@
+# Environnement Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Code Depth Anything 3 cloné par install.bat (re-téléchargé localement)
+repo/
+
+# Sorties générées
+outputs/
+workspace/
+.gradio/
+flagged/
+
+# Modèles / caches lourds
+*.safetensors
+*.ckpt
+*.pth
+hf_cache/
+
+# Claude Code / IDE
+.claude/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
