@@ -36,6 +36,7 @@ Double-clic sur **`run.bat`** → l'interface s'ouvre sur http://127.0.0.1:7860
    - `mesh.glb` — surface 3D texturée
    - `pointcloud\scene.glb` — nuage de points
    - `depth_16bit.png` — carte de profondeur 16-bit (height map)
+   - `depth_gray.png` — carte de profondeur noir & blanc 8-bit
    - `depth_color.png` — aperçu colorisé de la profondeur
 4. Dans Blender : `File > Import > glTF 2.0 (.glb)`.
 

@@ -160,10 +160,11 @@ def export_textured_mesh_glb(
 
 
 def export_depth_maps(prediction, out_dir: str, alpha_keep=None):
-    """Write a 16-bit grayscale depth (Blender displacement height map) and a colour preview.
+    """Write depth maps: 16-bit grayscale (Blender height map), 8-bit B&W, colour preview.
 
-    16-bit: depth normalised to its 1-99 percentile range, brighter = farther.
-    Transparent pixels (alpha) are set to black. Returns (path_16bit, path_color).
+    Depth normalised to its 1-99 percentile range, brighter = farther.
+    Transparent pixels (alpha) are set to black.
+    Returns (path_16bit, path_gray, path_color).
     """
     os.makedirs(out_dir, exist_ok=True)
     d = np.asarray(prediction.depth[0], dtype=np.float64)
@@ -181,12 +182,15 @@ def export_depth_maps(prediction, out_dir: str, alpha_keep=None):
     path16 = os.path.join(out_dir, "depth_16bit.png")
     imageio.imwrite(path16, (norm * 65535.0).astype(np.uint16))
 
+    path_gray = os.path.join(out_dir, "depth_gray.png")
+    imageio.imwrite(path_gray, (norm * 255.0).astype(np.uint8))
+
     color = visualize_depth(prediction.depth[0]).astype(np.uint8)  # (H,W,3)
     if alpha_keep is not None:
         color[~alpha_keep] = 0
     path_color = os.path.join(out_dir, "depth_color.png")
     imageio.imwrite(path_color, color)
-    return path16, path_color
+    return path16, path_gray, path_color
 
 
 # --------------------------------------------------------------------------------------
@@ -251,8 +255,10 @@ def run(image, process_res, conf_thresh_percentile, edge_rel_thresh, num_max_poi
             alpha_keep=alpha_keep,
         )
 
-        # 3) Depth maps (16-bit height map + colour preview)
-        depth16_path, depthcolor_path = export_depth_maps(prediction, run_dir, alpha_keep)
+        # 3) Depth maps (16-bit height map + 8-bit B&W + colour preview)
+        depth16_path, depthgray_path, depthcolor_path = export_depth_maps(
+            prediction, run_dir, alpha_keep
+        )
 
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
@@ -262,8 +268,8 @@ def run(image, process_res, conf_thresh_percentile, edge_rel_thresh, num_max_poi
             f"{prediction.depth.shape[1]}\nMesh: {mesh_path}\nPoints: {pcd_path}"
             f"\nDepth 16-bit: {depth16_path}"
         )
-        return (mesh_path, pcd_path, depthcolor_path,
-                mesh_path, pcd_path, depth16_path, depthcolor_path, status)
+        return (mesh_path, pcd_path, depthgray_path,
+                mesh_path, pcd_path, depth16_path, depthgray_path, depthcolor_path, status)
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         raise gr.Error("VRAM saturée. Baisse 'Résolution' (ex 392) et réessaie.")
@@ -311,10 +317,11 @@ def build_ui():
             with gr.Column(scale=1):
                 mesh_view = gr.Model3D(label="Mesh texturé (.glb)")
                 pcd_view = gr.Model3D(label="Nuage de points (.glb)")
-                depth_view = gr.Image(label="Depth map (preview colorisée)", height=240)
+                depth_view = gr.Image(label="Depth map (preview N&B)", height=240)
                 mesh_file = gr.File(label="Télécharger mesh.glb")
                 pcd_file = gr.File(label="Télécharger pointcloud .glb")
                 depth16_file = gr.File(label="Télécharger depth 16-bit (height map Blender)")
+                depthgray_file = gr.File(label="Télécharger depth N&B 8-bit")
                 depthcolor_file = gr.File(label="Télécharger depth colorisée")
                 status = gr.Textbox(label="Statut", lines=4)
 
@@ -322,7 +329,7 @@ def build_ui():
             run,
             inputs=[image, process_res, conf, edge, npts, full_frame],
             outputs=[mesh_view, pcd_view, depth_view,
-                     mesh_file, pcd_file, depth16_file, depthcolor_file, status],
+                     mesh_file, pcd_file, depth16_file, depthgray_file, depthcolor_file, status],
         )
     return demo
 
