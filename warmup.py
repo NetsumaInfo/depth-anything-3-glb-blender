@@ -5,17 +5,15 @@ import torch
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-from depth_anything_3.api import DepthAnything3
-
-MODEL_ID = os.environ.get("DA3_MODEL", "depth-anything/DA3-LARGE-1.1")
+# Reuse the app loader so the bf16 / forward setup matches exactly.
+import app
 
 
 def main():
     print("torch", torch.__version__, "cuda", torch.cuda.is_available())
     assert torch.cuda.is_available(), "CUDA not available — torch build is wrong."
-    print(f"downloading + loading {MODEL_ID} ...")
-    model = DepthAnything3.from_pretrained(MODEL_ID).to("cuda").eval()
-    model.device = torch.device("cuda")
+    print(f"downloading + loading {app.MODEL_ID} ...")
+    model = app.get_model()
 
     dummy = (np.random.rand(360, 480, 3) * 255).astype(np.uint8)
     pred = model.inference([dummy], process_res=392, export_dir=None)

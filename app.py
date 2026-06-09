@@ -29,16 +29,32 @@ from depth_anything_3.utils.visualize import visualize_depth  # noqa: E402
 # --------------------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------------------
-MODEL_ID = os.environ.get("DA3_MODEL", "depth-anything/DA3-LARGE-1.1")
+MODEL_ID = os.environ.get("DA3_MODEL", "depth-anything/DA3NESTED-GIANT-LARGE-1.1")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 OUTPUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+# Output choices the user can toggle in the UI.
+OUT_MESH = "Mesh texturé (.glb)"
+OUT_PCD = "Nuage de points (.glb)"
+OUT_COMBINED = "Combiné mesh + nuage (.glb)"
+OUT_PLANE = "Plan image + relief (.glb)"
+OUT_DEPTH = "Depth maps (16-bit / N&B / couleur)"
+ALL_OUTPUTS = [OUT_MESH, OUT_PCD, OUT_COMBINED, OUT_PLANE, OUT_DEPTH]
+DEFAULT_OUTPUTS = [OUT_MESH, OUT_COMBINED, OUT_PLANE, OUT_DEPTH]
 
 _MODEL: DepthAnything3 | None = None
 
 
 def get_model() -> DepthAnything3:
-    """Lazy-load the model once and keep it resident on the GPU."""
+    """Lazy-load the model once and keep it resident on the GPU.
+
+    Weights stay fp32: the depth head runs with autocast disabled and is built for
+    fp32 (sincos pos-embed, exp activation), so casting the net to bf16 corrupts the
+    dtype boundary. On an 8 GB card the big NESTED/GIANT checkpoints overflow VRAM and
+    spill into shared system RAM — slower, but correct and full quality. Drop the
+    resolution or switch DA3_MODEL to a lighter checkpoint if you need more speed.
+    """
     global _MODEL
     if _MODEL is None:
         print(f"[da3] loading {MODEL_ID} on {DEVICE} ...")
@@ -71,15 +87,19 @@ def _backproject_grid_to_world(depth, K, ext_w2c):
     return Xw
 
 
-def export_textured_mesh_glb(
+def build_textured_mesh(
     prediction,
-    out_dir: str,
     conf_thresh_percentile: float = 40.0,
     edge_rel_thresh: float = 0.05,
     full_frame: bool = False,
     alpha_keep: np.ndarray | None = None,
-) -> str:
-    """Build one textured triangle mesh from the first view and export it as mesh.glb.
+):
+    """Build one textured triangle mesh from the first view.
+
+    Returns ``(mesh, extras)``. ``extras`` carries the full-grid aligned vertices,
+    per-pixel colours, the keep mask, and the texture/size — everything the combined
+    and plane+relief exporters need so they share the SAME alignment as the mesh and
+    line up in world space.
 
     Faces are culled when a vertex is low-confidence or when the relative depth jump
     across the quad exceeds ``edge_rel_thresh`` (kills stretched background webbing).
@@ -87,8 +107,6 @@ def export_textured_mesh_glb(
     cropping); depth is clamped to its 1-99 percentile range to tame spikes.
     The scene is re-oriented to the glTF frame (Y up) so it imports upright in Blender.
     """
-    os.makedirs(out_dir, exist_ok=True)
-
     depth = np.asarray(prediction.depth[0], dtype=np.float64)        # (H, W)
     conf = np.asarray(prediction.conf[0], dtype=np.float64)          # (H, W)
     K = np.asarray(prediction.intrinsics[0], dtype=np.float64)       # (3, 3)
@@ -147,15 +165,126 @@ def export_textured_mesh_glb(
     uv = np.stack([us.reshape(-1) / max(W - 1, 1),
                    vs.reshape(-1) / max(H - 1, 1)], axis=1).astype(np.float32)
 
-    visual = trimesh.visual.TextureVisuals(uv=uv, image=Image.fromarray(img))
+    tex = Image.fromarray(img)
+    visual = trimesh.visual.TextureVisuals(uv=uv, image=tex)
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, visual=visual, process=False)
 
     # Drop vertices unused by any surviving face to slim the file.
     mesh.update_faces(mesh.nondegenerate_faces())
     mesh.remove_unreferenced_vertices()
 
+    extras = {
+        "verts": verts,                                  # (H*W, 3) aligned, full grid
+        "colors": img.reshape(-1, 3).astype(np.uint8),   # (H*W, 3)
+        "cloud_mask": vert_ok,                           # (H*W,) bool
+        "finite": finite.reshape(-1),                    # (H*W,) bool
+        "tex": tex,
+        "W": W,
+        "H": H,
+    }
+    return mesh, extras
+
+
+def export_textured_mesh_glb(
+    prediction,
+    out_dir: str,
+    conf_thresh_percentile: float = 40.0,
+    edge_rel_thresh: float = 0.05,
+    full_frame: bool = False,
+    alpha_keep: np.ndarray | None = None,
+) -> str:
+    """Build the textured relief mesh and write it as mesh.glb."""
+    os.makedirs(out_dir, exist_ok=True)
+    mesh, _ = build_textured_mesh(
+        prediction,
+        conf_thresh_percentile=conf_thresh_percentile,
+        edge_rel_thresh=edge_rel_thresh,
+        full_frame=full_frame,
+        alpha_keep=alpha_keep,
+    )
     out_path = os.path.join(out_dir, "mesh.glb")
     mesh.export(out_path)
+    return out_path
+
+
+def export_combined_glb(mesh, extras, out_dir: str, num_max_points: int) -> str:
+    """One GLB scene with the textured mesh AND the point cloud (same world frame).
+
+    Import once in Blender → relief surface + dense coloured points, both aligned.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    scene = trimesh.Scene()
+    scene.add_geometry(mesh.copy(), geom_name="mesh")
+
+    pv = extras["verts"][extras["cloud_mask"]]
+    pc = extras["colors"][extras["cloud_mask"]]
+    if pv.shape[0] > num_max_points:
+        sel = np.random.choice(pv.shape[0], int(num_max_points), replace=False)
+        pv, pc = pv[sel], pc[sel]
+    if pv.shape[0] > 0:
+        scene.add_geometry(trimesh.points.PointCloud(vertices=pv, colors=pc), geom_name="points")
+
+    out_path = os.path.join(out_dir, "combined.glb")
+    scene.export(out_path)
+    return out_path
+
+
+def _build_image_plane(extras) -> trimesh.Trimesh:
+    """A flat textured quad sitting just behind the relief, same image texture/UVs.
+
+    Corners are taken from the four corner patches of the aligned grid so the plane
+    spans exactly the relief's XY extent and shares its orientation.
+    """
+    verts = extras["verts"]
+    finite = extras["finite"]
+    H, W = extras["H"], extras["W"]
+    tex = extras["tex"]
+
+    g = verts.reshape(H, W, 3)
+    m = finite.reshape(H, W)
+    vv = verts[finite] if finite.any() else verts
+    zmin = float(vv[:, 2].min())
+    zspan = float(vv[:, 2].max() - zmin) or 1.0
+    zplane = zmin - 0.02 * zspan  # nudge behind the relief, avoid z-fighting
+
+    fh = max(H // 10, 1)
+    fw = max(W // 10, 1)
+
+    def patch(r0, r1, c0, c1):
+        s = g[r0:r1, c0:c1].reshape(-1, 3)
+        sm = m[r0:r1, c0:c1].reshape(-1)
+        s = s[sm]
+        return s.mean(axis=0) if len(s) else None
+
+    tl = patch(0, fh, 0, fw)
+    tr = patch(0, fh, W - fw, W)
+    bl = patch(H - fh, H, 0, fw)
+    br = patch(H - fh, H, W - fw, W)
+
+    if any(p is None for p in (tl, tr, bl, br)):
+        xmin, ymin = vv[:, 0].min(), vv[:, 1].min()
+        xmax, ymax = vv[:, 0].max(), vv[:, 1].max()
+        tl = np.array([xmin, ymax, 0.0])
+        tr = np.array([xmax, ymax, 0.0])
+        bl = np.array([xmin, ymin, 0.0])
+        br = np.array([xmax, ymin, 0.0])
+
+    corners = np.array([tl, tr, bl, br], dtype=np.float32)  # TL, TR, BL, BR
+    corners[:, 2] = zplane
+    faces = np.array([[0, 2, 1], [1, 2, 3]], dtype=np.int64)
+    uv = np.array([[0, 0], [1, 0], [0, 1], [1, 1]], dtype=np.float32)
+    visual = trimesh.visual.TextureVisuals(uv=uv, image=tex)
+    return trimesh.Trimesh(vertices=corners, faces=faces, visual=visual, process=False)
+
+
+def export_plane_relief_glb(mesh, extras, out_dir: str) -> str:
+    """One GLB scene with a flat image plane behind the textured relief mesh."""
+    os.makedirs(out_dir, exist_ok=True)
+    scene = trimesh.Scene()
+    scene.add_geometry(mesh.copy(), geom_name="relief")
+    scene.add_geometry(_build_image_plane(extras), geom_name="plane")
+    out_path = os.path.join(out_dir, "plane_relief.glb")
+    scene.export(out_path)
     return out_path
 
 
@@ -196,15 +325,18 @@ def export_depth_maps(prediction, out_dir: str, alpha_keep=None):
 # --------------------------------------------------------------------------------------
 # Pipeline
 # --------------------------------------------------------------------------------------
-def run(image, process_res, conf_thresh_percentile, edge_rel_thresh, num_max_points, full_frame):
+def run(image, process_res, conf_thresh_percentile, edge_rel_thresh, num_max_points,
+        full_frame, outputs):
     if image is None:
         raise gr.Error("Charge une image d'abord.")
+    outputs = outputs or []
+    if not outputs:
+        raise gr.Error("Coche au moins une sortie.")
     try:
         model = get_model()
 
         run_dir = os.path.join(OUTPUT_ROOT, time.strftime("%Y%m%d-%H%M%S"))
-        pcd_dir = os.path.join(run_dir, "pointcloud")
-        os.makedirs(pcd_dir, exist_ok=True)
+        os.makedirs(run_dir, exist_ok=True)
 
         arr = np.asarray(image)
         if arr.ndim == 2:
@@ -229,47 +361,72 @@ def run(image, process_res, conf_thresh_percentile, edge_rel_thresh, num_max_poi
             alpha_keep = a > 16
             prediction.conf[0][~alpha_keep] = -1.0
 
-        # In full-frame mode keep every point in the cloud too (no percentile cull).
-        pcd_pct = 0.0 if full_frame else float(conf_thresh_percentile)
-        pcd_base = 0.0 if full_frame else 1.05
+        mesh_path = pcd_path = combined_path = plane_path = None
+        depth16_path = depthgray_path = depthcolor_path = None
 
-        # 1) Point cloud GLB (reuse repo exporter; no cameras, no depth_vis -> avoids cp bug)
-        export_to_glb(
-            prediction,
-            pcd_dir,
-            num_max_points=int(num_max_points),
-            conf_thresh=pcd_base,
-            conf_thresh_percentile=pcd_pct,
-            show_cameras=False,
-            export_depth_vis=False,
-        )
-        pcd_path = os.path.join(pcd_dir, "scene.glb")
+        # Shared mesh geometry: built once, reused by mesh / combined / plane outputs.
+        mesh = extras = None
+        need_mesh = any(o in outputs for o in (OUT_MESH, OUT_COMBINED, OUT_PLANE))
+        if need_mesh:
+            mesh, extras = build_textured_mesh(
+                prediction,
+                conf_thresh_percentile=float(conf_thresh_percentile),
+                edge_rel_thresh=float(edge_rel_thresh),
+                full_frame=bool(full_frame),
+                alpha_keep=alpha_keep,
+            )
 
-        # 2) Textured mesh GLB (custom)
-        mesh_path = export_textured_mesh_glb(
-            prediction,
-            run_dir,
-            conf_thresh_percentile=float(conf_thresh_percentile),
-            edge_rel_thresh=float(edge_rel_thresh),
-            full_frame=bool(full_frame),
-            alpha_keep=alpha_keep,
-        )
+        if OUT_MESH in outputs:
+            mesh_path = os.path.join(run_dir, "mesh.glb")
+            mesh.export(mesh_path)
 
-        # 3) Depth maps (16-bit height map + 8-bit B&W + colour preview)
-        depth16_path, depthgray_path, depthcolor_path = export_depth_maps(
-            prediction, run_dir, alpha_keep
-        )
+        if OUT_COMBINED in outputs:
+            combined_path = export_combined_glb(mesh, extras, run_dir, int(num_max_points))
+
+        if OUT_PLANE in outputs:
+            plane_path = export_plane_relief_glb(mesh, extras, run_dir)
+
+        if OUT_PCD in outputs:
+            # Standalone point cloud (repo exporter; no cameras / depth_vis -> avoids cp bug).
+            pcd_dir = os.path.join(run_dir, "pointcloud")
+            os.makedirs(pcd_dir, exist_ok=True)
+            pcd_pct = 0.0 if full_frame else float(conf_thresh_percentile)
+            pcd_base = 0.0 if full_frame else 1.05
+            export_to_glb(
+                prediction,
+                pcd_dir,
+                num_max_points=int(num_max_points),
+                conf_thresh=pcd_base,
+                conf_thresh_percentile=pcd_pct,
+                show_cameras=False,
+                export_depth_vis=False,
+            )
+            pcd_path = os.path.join(pcd_dir, "scene.glb")
+
+        if OUT_DEPTH in outputs:
+            depth16_path, depthgray_path, depthcolor_path = export_depth_maps(
+                prediction, run_dir, alpha_keep
+            )
 
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
+        made = []
+        for label, p in [
+            ("Mesh", mesh_path), ("Combiné", combined_path), ("Plan+relief", plane_path),
+            ("Nuage", pcd_path), ("Depth 16-bit", depth16_path),
+        ]:
+            if p:
+                made.append(f"{label}: {p}")
         status = (
             f"OK — inference {infer_s:.1f}s · res {prediction.depth.shape[2]}x"
-            f"{prediction.depth.shape[1]}\nMesh: {mesh_path}\nPoints: {pcd_path}"
-            f"\nDepth 16-bit: {depth16_path}"
+            f"{prediction.depth.shape[1]}\n" + "\n".join(made)
         )
-        return (mesh_path, pcd_path, depthgray_path,
-                mesh_path, pcd_path, depth16_path, depthgray_path, depthcolor_path, status)
+        return (
+            mesh_path, pcd_path, combined_path, plane_path, depthgray_path,
+            mesh_path, pcd_path, combined_path, plane_path,
+            depth16_path, depthgray_path, depthcolor_path, status,
+        )
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         raise gr.Error("VRAM saturée. Baisse 'Résolution' (ex 392) et réessaie.")
@@ -286,13 +443,18 @@ def build_ui():
         gr.Markdown(
             "## Depth Anything 3 → GLB pour Blender\n"
             f"Modèle: `{MODEL_ID}` · device: `{DEVICE}`\n\n"
-            "Image en entrée → mesh texturé **.glb** + nuage de points **.glb**."
+            "Image en entrée → choisis tes sorties: mesh, nuage, **combiné** (mesh+nuage), "
+            "**plan+relief**, depth maps."
         )
         with gr.Row():
             with gr.Column(scale=1):
                 image = gr.Image(
                     label="Image d'entrée (alpha = trou)", type="numpy",
                     image_mode="RGBA", height=360,
+                )
+                out_select = gr.CheckboxGroup(
+                    choices=ALL_OUTPUTS, value=DEFAULT_OUTPUTS,
+                    label="Sorties à générer",
                 )
                 process_res = gr.Slider(
                     256, 1008, value=504, step=28, label="Résolution (baisse si VRAM saturée)"
@@ -311,25 +473,30 @@ def build_ui():
                 )
                 npts = gr.Slider(
                     50_000, 2_000_000, value=1_000_000, step=50_000,
-                    label="Max points (nuage)",
+                    label="Max points (nuage / combiné)",
                 )
                 btn = gr.Button("Générer GLB", variant="primary")
             with gr.Column(scale=1):
                 mesh_view = gr.Model3D(label="Mesh texturé (.glb)")
                 pcd_view = gr.Model3D(label="Nuage de points (.glb)")
+                combined_view = gr.Model3D(label="Combiné mesh + nuage (.glb)")
+                plane_view = gr.Model3D(label="Plan image + relief (.glb)")
                 depth_view = gr.Image(label="Depth map (preview N&B)", height=240)
                 mesh_file = gr.File(label="Télécharger mesh.glb")
                 pcd_file = gr.File(label="Télécharger pointcloud .glb")
+                combined_file = gr.File(label="Télécharger combiné .glb")
+                plane_file = gr.File(label="Télécharger plan+relief .glb")
                 depth16_file = gr.File(label="Télécharger depth 16-bit (height map Blender)")
                 depthgray_file = gr.File(label="Télécharger depth N&B 8-bit")
                 depthcolor_file = gr.File(label="Télécharger depth colorisée")
-                status = gr.Textbox(label="Statut", lines=4)
+                status = gr.Textbox(label="Statut", lines=5)
 
         btn.click(
             run,
-            inputs=[image, process_res, conf, edge, npts, full_frame],
-            outputs=[mesh_view, pcd_view, depth_view,
-                     mesh_file, pcd_file, depth16_file, depthgray_file, depthcolor_file, status],
+            inputs=[image, process_res, conf, edge, npts, full_frame, out_select],
+            outputs=[mesh_view, pcd_view, combined_view, plane_view, depth_view,
+                     mesh_file, pcd_file, combined_file, plane_file,
+                     depth16_file, depthgray_file, depthcolor_file, status],
         )
     return demo
 
